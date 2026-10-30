@@ -76,6 +76,9 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 	}
 
 	xmuxClient := xmuxManager.GetXmuxClient(ctx)
+	if xmuxClient != nil {
+		xmuxClient.AddRunning()
+	}
 	return xmuxClient.XmuxConn.(DialerClient), xmuxClient
 }
 
@@ -395,12 +398,6 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		errors.LogInfo(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", dest2, "stream-down", httpVersion2, requestURL2.Host))
 	}
 
-	if xmuxClient != nil {
-		xmuxClient.AddRunning()
-	}
-	if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
-		xmuxClient2.AddRunning()
-	}
 	var closed atomic.Int32
 
 	reader, writer := io.Pipe()
@@ -427,6 +424,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, false)
 		if err != nil { // browser dialer only
+			conn.onClose()
 			return nil, err
 		}
 		return stat.Connection(&conn), nil
@@ -436,6 +434,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(ctx, requestURL2.String(), sessionId, nil, false)
 		if err != nil { // browser dialer only
+			conn.onClose()
 			return nil, err
 		}
 	}
@@ -445,6 +444,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		_, _, _, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, true)
 		if err != nil { // browser dialer only
+			conn.onClose()
 			return nil, err
 		}
 		return stat.Connection(&conn), nil
@@ -475,6 +475,12 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 		dynamicHTTPClient := httpClient
 		dynamicXmuxClient := xmuxClient
+		ownsRunningRef := false
+		defer func() {
+			if ownsRunningRef && dynamicXmuxClient != nil {
+				dynamicXmuxClient.DoneRunning()
+			}
+		}()
 		for {
 			// by offloading the uploads into a buffered pipe, multiple conn.Write
 			// calls get automatically batched together into larger POST requests.
@@ -511,7 +517,12 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 				if dynamicXmuxClient != nil && (dynamicXmuxClient.LeftRequests.Add(-1) <= 0 ||
 					(dynamicXmuxClient.UnreusableAt != time.Time{} && lastWrite.After(dynamicXmuxClient.UnreusableAt))) {
-					dynamicHTTPClient, dynamicXmuxClient = getHTTPClient(ctx, dest, streamSettings)
+					newHTTPClient, newXmuxClient := getHTTPClient(ctx, dest, streamSettings)
+					if ownsRunningRef && dynamicXmuxClient != newXmuxClient {
+						dynamicXmuxClient.DoneRunning()
+					}
+					ownsRunningRef = newXmuxClient != nil
+					dynamicHTTPClient, dynamicXmuxClient = newHTTPClient, newXmuxClient
 				}
 
 				go func(hClient DialerClient) {

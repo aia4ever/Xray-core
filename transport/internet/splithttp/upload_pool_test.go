@@ -34,15 +34,18 @@ func TestUploadConnPoolCloseIdle(t *testing.T) {
 		},
 	}
 
+	// borrow dials a new connection
 	conn1, isNew, err := p.borrow(context.Background())
 	if err != nil || !isNew {
 		t.Fatal("expected a new connection, got", isNew, err)
 	}
+	// returned connections are reused
 	p.returnConn(conn1)
 	conn2, isNew, err := p.borrow(context.Background())
 	if err != nil || isNew || conn2 != conn1 {
 		t.Fatal("expected the pooled connection to be reused")
 	}
+	// an idle connection is closed by closeIdle
 	p.returnConn(conn2)
 	p.closeIdle()
 	mu.Lock()
@@ -50,12 +53,14 @@ func TestUploadConnPoolCloseIdle(t *testing.T) {
 		t.Fatal("expected the idle connection to be closed, closed =", closed)
 	}
 	mu.Unlock()
+	// connections returned after closeIdle are closed instead of pooled
 	p.returnConn(conn1)
 	mu.Lock()
 	if closed != 2 {
 		t.Fatal("expected the returned connection to be closed, closed =", closed)
 	}
 	mu.Unlock()
+	// and the pool dials fresh connections again
 	conn3, isNew, err := p.borrow(context.Background())
 	if err != nil || !isNew {
 		t.Fatal("expected a new connection after closeIdle")

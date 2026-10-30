@@ -20,6 +20,9 @@ import (
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
+// countingConn keeps track of physical connections opened by the XHTTP
+// client, so tests can assert that connections of retired XMUX clients are
+// actually closed and do not linger until IdleConnTimeout.
 type countingConn struct {
 	stdnet.Conn
 	closed  atomic.Bool
@@ -56,6 +59,10 @@ func waitForCondition(t *testing.T, timeout time.Duration, active *atomic.Int32,
 	t.Fatalf("condition not met within timeout: %s (active=%d, want=%d)", desc, active.Load(), want)
 }
 
+// With maxConnections=1 and hMaxRequestTimes=2, every second request rotates
+// to a new XMUX client. The retired client must not keep its physical
+// connection open until IdleConnTimeout (300s): once its last stream is
+// closed, the connection must be closed too.
 func Test_ListenXHAndDial_RetiredXmuxClientClosesConnection(t *testing.T) {
 	if runtime.GOARCH == "arm64" {
 		return
@@ -114,6 +121,8 @@ func Test_ListenXHAndDial_RetiredXmuxClientClosesConnection(t *testing.T) {
 	ctx := context.Background()
 	dest := net.TCPDestination(net.DomainAddress("localhost"), listenPort)
 
+	// stream 1: the GET goes to the first XMUX client, the first POST
+	// rotates to a second one and retires the first
 	conn, err := Dial(ctx, dest, clientSettings)
 	common.Must(err)
 	_, err = conn.Write([]byte("Test connection 1"))
@@ -127,8 +136,11 @@ func Test_ListenXHAndDial_RetiredXmuxClientClosesConnection(t *testing.T) {
 	}
 	common.Must(conn.Close())
 
+	// the retired client's connection must be closed; only the connection
+	// of the new client may stay open
 	waitForCondition(t, 5*time.Second, &active, 1, "retired XMUX client did not close its connection")
 
+	// a second stream still works and rotates again
 	conn, err = Dial(ctx, dest, clientSettings)
 	common.Must(err)
 	_, err = conn.Write([]byte("Test connection 2"))

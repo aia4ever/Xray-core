@@ -34,6 +34,7 @@ type DefaultDialerClient struct {
 	client          *http.Client
 	closed          atomic.Bool
 	httpVersion     string
+	// pool of H1Conn for HTTP/1.1 uploads, created using dialUploadConn
 	uploadPool     *uploadConnPool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
 }
@@ -170,6 +171,10 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	return nil
 }
 
+// CloseIdleConnections retires the client: no new requests should be issued
+// on it, but requests already in flight are allowed to finish. Physical
+// connections that are currently idle are closed right away, so that
+// connections of retired clients do not linger until IdleConnTimeout.
 func (c *DefaultDialerClient) CloseIdleConnections() {
 	if transport, ok := c.client.Transport.(interface{ CloseIdleConnections() }); ok {
 		transport.CloseIdleConnections()
@@ -177,6 +182,11 @@ func (c *DefaultDialerClient) CloseIdleConnections() {
 	c.uploadPool.closeIdle()
 }
 
+// Close implements common.Closable. For HTTP/3 the whole transport including
+// in-flight requests is terminated. HTTP/1.1 and HTTP/2 connections cannot be
+// force-closed through their transports, so for them this is equivalent to
+// CloseIdleConnections: idle connections are closed, in-flight requests are
+// allowed to finish.
 func (c *DefaultDialerClient) Close() error {
 	if h3Transport, ok := c.client.Transport.(*http3.Transport); ok {
 		h3Transport.Close()

@@ -23,6 +23,9 @@ type XmuxClient struct {
 	LeftRequests atomic.Int32
 	UnreusableAt time.Time
 	NotUsed      atomic.Bool
+	// Requests counts HTTP requests that were issued through this client
+	// and are still in flight, including requests of upload loops whose
+	// connection has already closed
 	Requests atomic.Int32
 }
 

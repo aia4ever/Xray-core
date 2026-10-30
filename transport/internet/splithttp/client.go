@@ -3,6 +3,7 @@ package splithttp
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal/done"
+	"golang.org/x/net/http2"
 )
 
 // interface to abstract between use of browser dialer, vs net/http
@@ -33,7 +35,7 @@ type DialerClient interface {
 type DefaultDialerClient struct {
 	transportConfig *Config
 	client          *http.Client
-	closed      atomic.Bool
+	retired    atomic.Bool
 	httpVersion string
 	// pool of H1Conn for HTTP/1.1 uploads, created using dialUploadConn
 	uploadPool     *uploadConnPool
@@ -41,7 +43,23 @@ type DefaultDialerClient struct {
 }
 
 func (c *DefaultDialerClient) IsClosed() bool {
-	return c.closed.Load()
+	return c.retired.Load()
+}
+
+func isRequestScopedError(err error) bool {
+	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var streamErr http2.StreamError
+	return stderrors.As(err, &streamErr)
+}
+
+func (c *DefaultDialerClient) maybeRetire(err error) {
+	if isRequestScopedError(err) {
+		return
+	}
+	c.retired.Store(true)
+	c.CloseIdleConnections()
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
@@ -73,7 +91,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		resp, err := c.client.Do(req)
 		if err != nil {
 			if !uploadOnly { // stream-down is enough
-				c.closed.Store(true)
+				c.maybeRetire(err)
 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
 			}
 			gotConn.Close()
@@ -111,7 +129,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)
 		if err != nil {
-			c.closed.Store(true)
+			c.maybeRetire(err)
 			return err
 		}
 
@@ -145,7 +163,6 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 				if h1UploadConn.UnreadedResponsesCount > 0 {
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
-						c.closed.Store(true)
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
 					io.Copy(io.Discard, resp.Body)
@@ -203,11 +220,18 @@ type WaitReadCloser struct {
 	wait   *done.Instance
 	reader atomic.Pointer[io.ReadCloser]
 
+	// onFinish is called exactly once, when the request that produced this
+	// reader has fully finished: either its response body was closed, or it
+	// failed before a response arrived. It may be registered after the
+	// request was issued, including after the reader was already closed
+	// without ever receiving a response: the callback then fires as soon as
+	// the pending request finishes.
 	mu       sync.Mutex
 	finished bool
 	onFinish func()
 }
 
+// finish marks the request as finished and fires the callback.
 func (w *WaitReadCloser) finish() {
 	w.mu.Lock()
 	if w.finished {
@@ -222,6 +246,8 @@ func (w *WaitReadCloser) finish() {
 	}
 }
 
+// OnFinish registers f to be called when the request has finished. If it
+// already has, f is called immediately.
 func (w *WaitReadCloser) OnFinish(f func()) {
 	w.mu.Lock()
 	already := w.finished

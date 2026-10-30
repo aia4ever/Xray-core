@@ -44,6 +44,11 @@ var (
 	globalDialerAccess sync.Mutex
 )
 
+// holdStreamRequest takes a request reference on xmuxClient for the lifetime
+// of the HTTP stream opened on reader: the response can still be in flight
+// after the connection that owns the reader has closed, and a retired client
+// must neither be closed under the request nor keep its connection open after
+// the request finishes.
 func holdStreamRequest(reader io.ReadCloser, xmuxClient *XmuxClient) {
 	if wrc, ok := reader.(*WaitReadCloser); ok && xmuxClient != nil {
 		xmuxClient.AddRequest()
@@ -549,6 +554,12 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 					dynamicHTTPClient, dynamicXmuxClient = newHTTPClient, newXmuxClient
 				}
 
+				// hold a request reference for the POST: the upload loop
+				// does not wait for the response, so the POST can still be
+				// in flight after this loop, and even after the connection
+				// that spawned it, has closed. The reference keeps the
+				// rotated-away client from being closed under the POST, and
+				// lets it be closed as soon as the POST is done
 				if dynamicXmuxClient != nil {
 					dynamicXmuxClient.AddRequest()
 				}

@@ -22,6 +22,9 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// startH2TLSServer serves handler over HTTP/2 with TLS, using the certificate
+// the test client pins. Tests get full control over response timing and
+// stream handling, which the XHTTP hub does not expose.
 func startH2TLSServer(t *testing.T, handler http.Handler) (net.Destination, *cert.Certificate, [32]byte) {
 	t.Helper()
 
@@ -69,6 +72,8 @@ func startH2TLSServer(t *testing.T, handler http.Handler) (net.Destination, *cer
 	return net.TCPDestination(net.DomainAddress("localhost"), port), generatedCert, certHash
 }
 
+// dialCountingConns tracks both the connections currently open and the total
+// number of physical connections dialed by the XHTTP client.
 func dialCountingConns(active *atomic.Int32, total *atomic.Int32) func(context.Context, net.Destination) (net.Conn, error) {
 	inner := dialCountingConn(active)
 	return func(ctx context.Context, dest net.Destination) (net.Conn, error) {
@@ -100,6 +105,11 @@ func h2ClientSettings(serverCert *cert.Certificate, serverCertHash [32]byte, act
 	}
 }
 
+// With maxConnections=1 and hMaxRequestTimes=2, the second upload POST rotates
+// to a new XMUX client, retiring the first. The POST already issued on the
+// retired client can still be awaiting its response: it must not be aborted,
+// and the retired client's connection must be closed as soon as its last POST
+// finishes, not left to linger until IdleConnTimeout.
 func Test_ListenXHAndDial_InFlightUploadOutlivesRotation(t *testing.T) {
 	if runtime.GOARCH == "arm64" {
 		return
@@ -109,13 +119,13 @@ func Test_ListenXHAndDial_InFlightUploadOutlivesRotation(t *testing.T) {
 	var posts atomic.Int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodGet:
+		case http.MethodGet: // the download stream
 			select {
 			case <-release:
 			case <-r.Context().Done():
 			}
 			return
-		case http.MethodPost:
+		case http.MethodPost: // an upload packet
 			posts.Add(1)
 			select {
 			case <-release:
@@ -135,6 +145,10 @@ func Test_ListenXHAndDial_InFlightUploadOutlivesRotation(t *testing.T) {
 	conn, err := Dial(ctx, dest, clientSettings)
 	common.Must(err)
 
+	// with scMaxEachPostBytes=1KB, a 1.5KB write is split into exactly two
+	// POSTs: the first one is issued on the initial XMUX client, the second
+	// one rotates to a new client and retires the first while the first POST
+	// is still in flight, its response withheld by the server
 	common.Must2(conn.Write(make([]byte, 3<<10/2)))
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -148,12 +162,15 @@ func Test_ListenXHAndDial_InFlightUploadOutlivesRotation(t *testing.T) {
 		t.Fatal("expected two physical connections (retired client + new client), got ", active.Load())
 	}
 
+	// close the stream: the retired client must stay alive for its in-flight
+	// POST, even though nothing else references it anymore
 	common.Must(conn.Close())
 	time.Sleep(300 * time.Millisecond)
 	if active.Load() != 2 {
 		t.Fatal("the retired client's connection was closed while its POST was still in flight, got ", active.Load())
 	}
 
+	// let the POSTs finish: the retired client's connection must close now
 	close(release)
 	waitForCondition(t, 5*time.Second, &active, 1, "retired client did not close its connection after its last POST finished")
 }

@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
-	"sync"
 	"sync/atomic"
 
 	"github.com/apernet/quic-go/http3"
@@ -35,8 +34,7 @@ type DefaultDialerClient struct {
 	client          *http.Client
 	closed          atomic.Bool
 	httpVersion     string
-	// pool of net.Conn, created using dialUploadConn
-	uploadRawPool  *sync.Pool
+	uploadPool     *uploadConnPool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
 }
 
@@ -128,22 +126,16 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 		requestBuff.Grow(512 + int(req.ContentLength))
 		common.Must(req.Write(requestBuff))
 
-		var uploadConn any
 		var h1UploadConn *H1Conn
-
 		for {
-			uploadConn = c.uploadRawPool.Get()
-			newConnection := uploadConn == nil
-			if newConnection {
-				newConn, err := c.dialUploadConn(context.WithoutCancel(ctx))
-				if err != nil {
-					return err
-				}
-				h1UploadConn = NewH1Conn(newConn)
-				uploadConn = h1UploadConn
-			} else {
-				h1UploadConn = uploadConn.(*H1Conn)
+			var newConnection bool
+			var err error
+			h1UploadConn, newConnection, err = c.uploadPool.borrow(context.WithoutCancel(ctx))
+			if err != nil {
+				return err
+			}
 
+			if !newConnection {
 				// TODO: Replace 0 here with a config value later
 				// Or add some other condition for optimization purposes
 				if h1UploadConn.UnreadedResponsesCount > 0 {
@@ -160,7 +152,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 				}
 			}
 
-			_, err := h1UploadConn.Write(requestBuff.Bytes())
+			_, err = h1UploadConn.Write(requestBuff.Bytes())
 			// if the write failed, we try another connection from
 			// the pool, until the write on a new connection fails.
 			// failed writes to a pooled connection are normal when
@@ -172,18 +164,25 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 			}
 		}
 
-		c.uploadRawPool.Put(uploadConn)
+		c.uploadPool.returnConn(h1UploadConn)
 	}
 
 	return nil
 }
 
-// HTTP/1.1 and HTTP/2 will close itself, we only handle HTTP/3 here
-func (c *DefaultDialerClient) Close() error {
-	transport := c.client.Transport
-	if h3Transport, ok := transport.(*http3.Transport); ok {
-		h3Transport.Close()
+func (c *DefaultDialerClient) CloseIdleConnections() {
+	if transport, ok := c.client.Transport.(interface{ CloseIdleConnections() }); ok {
+		transport.CloseIdleConnections()
 	}
+	c.uploadPool.closeIdle()
+}
+
+func (c *DefaultDialerClient) Close() error {
+	if h3Transport, ok := c.client.Transport.(*http3.Transport); ok {
+		h3Transport.Close()
+		return nil
+	}
+	c.CloseIdleConnections()
 	return nil
 }
 

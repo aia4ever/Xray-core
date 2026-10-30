@@ -37,7 +37,11 @@ func (c *XmuxClient) DoneRunning() {
 // close the XmuxConn if it is not used and has no running requests
 func (c *XmuxClient) maybeClose() {
 	if c.NotUsed.Load() && c.Running.Load() <= 0 {
-		common.Close(c.XmuxConn)
+		if idleCloser, ok := c.XmuxConn.(interface{ CloseIdleConnections() }); ok {
+			idleCloser.CloseIdleConnections()
+		} else {
+			common.Close(c.XmuxConn)
+		}
 	}
 }
 

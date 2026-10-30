@@ -23,12 +23,13 @@ func (c *splitConn) Read(b []byte) (int, error) {
 }
 
 func (c *splitConn) Close() error {
+	err := c.writer.Close()
+	err2 := c.reader.Close()
+
 	if c.onClose != nil {
 		c.onClose()
 	}
 
-	err := c.writer.Close()
-	err2 := c.reader.Close()
 	if err != nil {
 		return err
 	}

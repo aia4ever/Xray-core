@@ -28,6 +28,11 @@ type MemoryStreamConfig struct {
 	onClose []func()
 }
 
+// RegisterOnClose registers f to run once when the config is closed. It
+// returns false if the config was already closed, in which case f is not
+// registered and not run: the caller must undo whatever it did that the
+// callback would have undone. Callbacks run without any lock held, so they
+// may acquire any lock, including ones held by callers of this function.
 func (m *MemoryStreamConfig) RegisterOnClose(f func()) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -38,6 +43,8 @@ func (m *MemoryStreamConfig) RegisterOnClose(f func()) bool {
 	return true
 }
 
+// Close implements common.Closable. It runs the registered close callbacks
+// and closes the DownloadSettings as well. Closing twice is a no-op.
 func (m *MemoryStreamConfig) Close() error {
 	m.mu.Lock()
 	if m.closed {
@@ -59,6 +66,8 @@ func (m *MemoryStreamConfig) Close() error {
 	return nil
 }
 
+// SetDownloadSettings sets the DownloadSettings if they are not set yet, and
+// returns the settings that are in effect afterwards.
 func (m *MemoryStreamConfig) SetDownloadSettings(ds *MemoryStreamConfig) *MemoryStreamConfig {
 	m.mu.Lock()
 	defer m.mu.Unlock()

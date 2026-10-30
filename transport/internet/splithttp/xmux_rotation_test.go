@@ -18,6 +18,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/finalmask"
 	. "github.com/xtls/xray-core/transport/internet/splithttp"
+	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
 	"golang.org/x/net/http2"
 )
@@ -119,13 +120,13 @@ func Test_ListenXHAndDial_InFlightUploadOutlivesRotation(t *testing.T) {
 	var posts atomic.Int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodGet: // the download stream
+		case http.MethodGet:
 			select {
 			case <-release:
 			case <-r.Context().Done():
 			}
 			return
-		case http.MethodPost: // an upload packet
+		case http.MethodPost:
 			posts.Add(1)
 			select {
 			case <-release:
@@ -173,4 +174,72 @@ func Test_ListenXHAndDial_InFlightUploadOutlivesRotation(t *testing.T) {
 	// let the POSTs finish: the retired client's connection must close now
 	close(release)
 	waitForCondition(t, 5*time.Second, &active, 1, "retired client did not close its connection after its last POST finished")
+}
+
+func Test_ListenXHAndDial_ConcurrentRequestsDialOneConnection(t *testing.T) {
+	if runtime.GOARCH == "arm64" {
+		return
+	}
+
+	release := make(chan struct{})
+	const streamsWanted = 24
+	var streams atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet: // the download stream
+			if streams.Add(1) == streamsWanted {
+				close(release)
+			} else {
+				select {
+				case <-release:
+				case <-r.Context().Done():
+				}
+			}
+			return
+		case http.MethodPost: // an upload packet
+			io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusOK)
+		}
+	})
+
+	dest, serverCert, serverCertHash := startH2TLSServer(t, handler)
+	var active atomic.Int32
+	var total atomic.Int32
+	clientSettings := h2ClientSettings(serverCert, serverCertHash, &active, &total)
+	clientSettings.ProtocolSettings.(*Config).Xmux.HMaxRequestTimes = &RangeConfig{From: 1000, To: 1000}
+
+	ctx := context.Background()
+	conns := make(chan stat.Connection, streamsWanted)
+	var wg sync.WaitGroup
+	for i := 0; i < streamsWanted; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := Dial(ctx, dest, clientSettings)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			conns <- conn
+		}()
+	}
+	wg.Wait()
+	close(conns)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for streams.Load() < streamsWanted && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if streams.Load() < streamsWanted {
+		t.Fatal("expected ", streamsWanted, " open streams, got ", streams.Load())
+	}
+	time.Sleep(500 * time.Millisecond)
+
+	for conn := range conns {
+		conn.Close()
+	}
+
+	if total.Load() != 1 {
+		t.Fatal("expected a single physical connection for concurrent streams, dialed: ", total.Load())
+	}
 }

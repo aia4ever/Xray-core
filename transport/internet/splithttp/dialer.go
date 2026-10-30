@@ -91,6 +91,11 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 			return createHTTPClient(dest, streamSettings)
 		})
 		globalDialerMap[key] = xmuxManager
+		// drop the manager again when the settings it belongs to are closed,
+		// e.g. on a config reload or core shutdown: without this, the map
+		// entry outlives the handler and its connections are never retired.
+		// The callbacks of a closed config do not run, so a dial racing with
+		// the close simply leaves its manager uncached.
 		if !streamSettings.RegisterOnClose(func() {
 			globalDialerAccess.Lock()
 			defer globalDialerAccess.Unlock()

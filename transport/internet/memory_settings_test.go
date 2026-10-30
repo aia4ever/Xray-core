@@ -28,6 +28,7 @@ func TestMemoryStreamConfigClose(t *testing.T) {
 		t.Fatal("expected the download settings to be closed as well, got ", childCloses.Load())
 	}
 
+	// closing again is a no-op
 	if err := mss.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -35,6 +36,7 @@ func TestMemoryStreamConfigClose(t *testing.T) {
 		t.Fatal("expected close callbacks to run only once")
 	}
 
+	// registering on a closed config reports failure and runs nothing
 	if mss.RegisterOnClose(func() { lateCloses.Add(1) }) {
 		t.Fatal("expected registration on a closed config to fail")
 	}

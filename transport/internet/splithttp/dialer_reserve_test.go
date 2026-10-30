@@ -127,6 +127,9 @@ func TestXmuxClientRequestReferences(t *testing.T) {
 	}
 }
 
+// closing the stream settings, e.g. on a config reload or core shutdown, must
+// drop the dialer map entry of the settings and retire the manager's clients,
+// instead of leaking them until the process ends
 func TestGetHTTPClientCleansUpDialerMapOnSettingsClose(t *testing.T) {
 	dest := net.TCPDestination(net.DomainAddress("cleanup.test"), 443)
 	settings := &internet.MemoryStreamConfig{
@@ -165,6 +168,7 @@ func TestGetHTTPClientCleansUpDialerMapOnSettingsClose(t *testing.T) {
 		t.Fatal("expected the dialer map entry to be removed on close")
 	}
 
+	// a dial racing with the close must not re-cache the manager
 	_, xmuxClient2 := getHTTPClient(context.Background(), dest, settings)
 	defer xmuxClient2.DoneRunning()
 	globalDialerAccess.Lock()

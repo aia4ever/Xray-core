@@ -91,6 +91,21 @@ func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *in
 			return createHTTPClient(dest, streamSettings)
 		})
 		globalDialerMap[key] = xmuxManager
+		if !streamSettings.RegisterOnClose(func() {
+			globalDialerAccess.Lock()
+			defer globalDialerAccess.Unlock()
+			if globalDialerMap[key] != xmuxManager {
+				return
+			}
+			delete(globalDialerMap, key)
+			for _, xmuxClient := range xmuxManager.xmuxClients {
+				xmuxClient.NotUsed.Store(true)
+				xmuxClient.maybeClose()
+			}
+			xmuxManager.xmuxClients = nil
+		}) {
+			delete(globalDialerMap, key)
+		}
 	}
 
 	xmuxClient := xmuxManager.GetXmuxClient(ctx)
@@ -374,9 +389,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if transportConfiguration.DownloadSettings != nil {
 		globalDialerAccess.Lock()
 		if streamSettings.DownloadSettings == nil {
-			streamSettings.DownloadSettings = common.Must2(internet.ToMemoryStreamConfig(transportConfiguration.DownloadSettings))
+			memory2 := streamSettings.SetDownloadSettings(common.Must2(internet.ToMemoryStreamConfig(transportConfiguration.DownloadSettings)))
 			if streamSettings.SocketSettings != nil && streamSettings.SocketSettings.Penetrate {
-				streamSettings.DownloadSettings.SocketSettings = streamSettings.SocketSettings
+				memory2.SocketSettings = streamSettings.SocketSettings
 			}
 		}
 		globalDialerAccess.Unlock()

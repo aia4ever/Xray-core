@@ -127,6 +127,54 @@ func TestXmuxClientRequestReferences(t *testing.T) {
 	}
 }
 
+func TestGetHTTPClientCleansUpDialerMapOnSettingsClose(t *testing.T) {
+	dest := net.TCPDestination(net.DomainAddress("cleanup.test"), 443)
+	settings := &internet.MemoryStreamConfig{
+		ProtocolName:     "splithttp",
+		ProtocolSettings: &Config{},
+	}
+	key := dialerConf{dest, settings}
+	defer func() {
+		globalDialerAccess.Lock()
+		delete(globalDialerMap, key)
+		globalDialerAccess.Unlock()
+	}()
+
+	httpClient, xmuxClient := getHTTPClient(context.Background(), dest, settings)
+	if httpClient == nil || xmuxClient == nil {
+		t.Fatal("expected getHTTPClient to return a client")
+	}
+
+	globalDialerAccess.Lock()
+	_, found := globalDialerMap[key]
+	globalDialerAccess.Unlock()
+	if !found {
+		t.Fatal("expected the dialer map to cache the manager")
+	}
+
+	if err := settings.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !xmuxClient.NotUsed.Load() {
+		t.Fatal("expected the XMUX client to be retired")
+	}
+	globalDialerAccess.Lock()
+	_, found = globalDialerMap[key]
+	globalDialerAccess.Unlock()
+	if found {
+		t.Fatal("expected the dialer map entry to be removed on close")
+	}
+
+	_, xmuxClient2 := getHTTPClient(context.Background(), dest, settings)
+	defer xmuxClient2.DoneRunning()
+	globalDialerAccess.Lock()
+	_, found = globalDialerMap[key]
+	globalDialerAccess.Unlock()
+	if found {
+		t.Fatal("expected no dialer map entry after the settings were closed")
+	}
+}
+
 func TestIsRequestScopedError(t *testing.T) {
 	for _, tt := range []struct {
 		err  error
@@ -145,6 +193,8 @@ func TestIsRequestScopedError(t *testing.T) {
 	}
 }
 
+// a single failed request must not retire the client unless the error means
+// the client's connections are unusable
 func TestDefaultDialerClientMaybeRetire(t *testing.T) {
 	newClient := func() *DefaultDialerClient {
 		return &DefaultDialerClient{
@@ -183,7 +233,11 @@ func newRetireTestClient(err error) *DefaultDialerClient {
 	}
 }
 
+// errors that failed a single request must not retire the client: retiring
+// drops the client from the XMUX manager and forces the next stream onto a
+// freshly dialed connection
 func TestDefaultDialerClientRequestErrors(t *testing.T) {
+	// an upload packet failed by a request-scoped error
 	c := newRetireTestClient(http2.StreamError{StreamID: 1, Code: http2.ErrCodeCancel})
 	if err := c.PostPacket(context.Background(), "https://example.com/", "session", "0", nil); err == nil {
 		t.Fatal("expected the POST to fail")
@@ -192,6 +246,7 @@ func TestDefaultDialerClientRequestErrors(t *testing.T) {
 		t.Fatal("a request-scoped error retired the client")
 	}
 
+	// an upload packet failed by a connection error
 	c = newRetireTestClient(stderrors.New("connection reset by peer"))
 	if err := c.PostPacket(context.Background(), "https://example.com/", "session", "0", nil); err == nil {
 		t.Fatal("expected the POST to fail")
@@ -200,11 +255,14 @@ func TestDefaultDialerClientRequestErrors(t *testing.T) {
 		t.Fatal("expected a connection error to retire the client")
 	}
 
+	// a download stream failed by a connection error
 	c = newRetireTestClient(stderrors.New("connection reset by peer"))
 	wrc, _, _, err := c.OpenStream(context.Background(), "https://example.com/", "session", nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// the stream reader resolves once the failed request has been handled,
+	// and the retire happens before that
 	if _, err := wrc.Read(make([]byte, 1)); err != io.ErrClosedPipe && err != io.EOF {
 		t.Fatal("expected the stream reader to resolve, got ", err)
 	}
@@ -212,6 +270,7 @@ func TestDefaultDialerClientRequestErrors(t *testing.T) {
 		t.Fatal("expected a connection error to retire the client")
 	}
 
+	// a failed pure-upload stream must not retire the client either
 	c = newRetireTestClient(stderrors.New("connection reset by peer"))
 	wrc, _, _, err = c.OpenStream(context.Background(), "https://example.com/", "session", nil, true)
 	if err != nil {

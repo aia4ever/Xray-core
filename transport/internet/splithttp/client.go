@@ -35,6 +35,9 @@ type DialerClient interface {
 type DefaultDialerClient struct {
 	transportConfig *Config
 	client          *http.Client
+	// retired marks the client as unusable for new selection by the XMUX
+	// manager. It does not abort requests already in flight: retirement
+	// drains, see maybeRetire
 	retired    atomic.Bool
 	httpVersion string
 	// pool of H1Conn for HTTP/1.1 uploads, created using dialUploadConn
@@ -46,6 +49,8 @@ func (c *DefaultDialerClient) IsClosed() bool {
 	return c.retired.Load()
 }
 
+// isRequestScopedError reports whether err failed only the request that hit
+// it, while the client's connections remain usable by other requests.
 func isRequestScopedError(err error) bool {
 	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
 		return true
@@ -54,6 +59,12 @@ func isRequestScopedError(err error) bool {
 	return stderrors.As(err, &streamErr)
 }
 
+// maybeRetire retires the client when err indicates that its connections are
+// unusable. Retiring closes the idle connections right away and lets the
+// requests in flight finish; the XMUX manager stops selecting the client on
+// its next sweep. Request-scoped errors leave the client alone: a single
+// failed request used to poison the whole client, dropping it from the
+// manager and forcing the next stream onto a freshly dialed connection.
 func (c *DefaultDialerClient) maybeRetire(err error) {
 	if isRequestScopedError(err) {
 		return
@@ -163,6 +174,10 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 				if h1UploadConn.UnreadedResponsesCount > 0 {
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
+						// the pooled connection is broken, but the client
+						// and its other pooled connections are not: the
+						// connection is simply dropped by not being returned
+						// to the pool
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
 					io.Copy(io.Discard, resp.Body)

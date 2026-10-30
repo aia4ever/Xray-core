@@ -3,6 +3,7 @@ package internet
 import (
 	"context"
 	"reflect"
+	"sync"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/net"
@@ -21,6 +22,50 @@ type MemoryStreamConfig struct {
 	QuicParams       *QuicParams
 	SocketSettings   *SocketConfig
 	DownloadSettings *MemoryStreamConfig
+
+	mu      sync.Mutex
+	closed  bool
+	onClose []func()
+}
+
+func (m *MemoryStreamConfig) RegisterOnClose(f func()) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return false
+	}
+	m.onClose = append(m.onClose, f)
+	return true
+}
+
+func (m *MemoryStreamConfig) Close() error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.closed = true
+	callbacks := m.onClose
+	m.onClose = nil
+	downloadSettings := m.DownloadSettings
+	m.mu.Unlock()
+
+	for _, f := range callbacks {
+		f()
+	}
+	if downloadSettings != nil {
+		downloadSettings.Close()
+	}
+	return nil
+}
+
+func (m *MemoryStreamConfig) SetDownloadSettings(ds *MemoryStreamConfig) *MemoryStreamConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.DownloadSettings == nil {
+		m.DownloadSettings = ds
+	}
+	return m.DownloadSettings
 }
 
 // ToMemoryStreamConfig converts a StreamConfig to MemoryStreamConfig. It returns a default non-nil MemoryStreamConfig for nil input.

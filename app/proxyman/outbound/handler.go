@@ -331,6 +331,7 @@ func (h *Handler) Start() error {
 func (h *Handler) Close() error {
 	common.Close(h.mux)
 	common.Close(h.proxy)
+	common.Close(h.streamSettings)
 	return nil
 }
 

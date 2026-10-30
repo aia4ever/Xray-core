@@ -3,6 +3,7 @@ package splithttp
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/signal/done"
+	"golang.org/x/net/http2"
 )
 
 // interface to abstract between use of browser dialer, vs net/http
@@ -33,15 +35,42 @@ type DialerClient interface {
 type DefaultDialerClient struct {
 	transportConfig *Config
 	client          *http.Client
-	closed          atomic.Bool
-	httpVersion     string
-	// pool of net.Conn, created using dialUploadConn
-	uploadRawPool  *sync.Pool
+	// retired marks the client as unusable for new selection by the XMUX
+	// manager. It does not abort requests already in flight: retirement
+	// drains, see maybeRetire
+	retired    atomic.Bool
+	httpVersion string
+	// pool of H1Conn for HTTP/1.1 uploads, created using dialUploadConn
+	uploadPool     *uploadConnPool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
 }
 
 func (c *DefaultDialerClient) IsClosed() bool {
-	return c.closed.Load()
+	return c.retired.Load()
+}
+
+// isRequestScopedError reports whether err failed only the request that hit
+// it, while the client's connections remain usable by other requests.
+func isRequestScopedError(err error) bool {
+	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var streamErr http2.StreamError
+	return stderrors.As(err, &streamErr)
+}
+
+// maybeRetire retires the client when err indicates that its connections are
+// unusable. Retiring closes the idle connections right away and lets the
+// requests in flight finish; the XMUX manager stops selecting the client on
+// its next sweep. Request-scoped errors leave the client alone: a single
+// failed request used to poison the whole client, dropping it from the
+// manager and forcing the next stream onto a freshly dialed connection.
+func (c *DefaultDialerClient) maybeRetire(err error) {
+	if isRequestScopedError(err) {
+		return
+	}
+	c.retired.Store(true)
+	c.CloseIdleConnections()
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessionId string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {
@@ -73,12 +102,13 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 		resp, err := c.client.Do(req)
 		if err != nil {
 			if !uploadOnly { // stream-down is enough
-				c.closed.Store(true)
+				c.maybeRetire(err)
 				errors.LogInfoInner(ctx, err, "failed to "+method+" "+url)
 			}
 			gotConn.Close()
 			common.Close(body)
 			wrc.Close()
+			wrc.(*WaitReadCloser).finish()
 			return
 		}
 		if resp.StatusCode != 200 && !uploadOnly {
@@ -89,6 +119,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 			resp.Body.Close() // if it is called immediately, the upload will be interrupted also
 			common.Close(body)
 			wrc.Close()
+			wrc.(*WaitReadCloser).finish()
 			return
 		}
 		wrc.(*WaitReadCloser).Set(resp.Body)
@@ -109,7 +140,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)
 		if err != nil {
-			c.closed.Store(true)
+			c.maybeRetire(err)
 			return err
 		}
 
@@ -128,28 +159,25 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 		requestBuff.Grow(512 + int(req.ContentLength))
 		common.Must(req.Write(requestBuff))
 
-		var uploadConn any
 		var h1UploadConn *H1Conn
-
 		for {
-			uploadConn = c.uploadRawPool.Get()
-			newConnection := uploadConn == nil
-			if newConnection {
-				newConn, err := c.dialUploadConn(context.WithoutCancel(ctx))
-				if err != nil {
-					return err
-				}
-				h1UploadConn = NewH1Conn(newConn)
-				uploadConn = h1UploadConn
-			} else {
-				h1UploadConn = uploadConn.(*H1Conn)
+			var newConnection bool
+			var err error
+			h1UploadConn, newConnection, err = c.uploadPool.borrow(context.WithoutCancel(ctx))
+			if err != nil {
+				return err
+			}
 
+			if !newConnection {
 				// TODO: Replace 0 here with a config value later
 				// Or add some other condition for optimization purposes
 				if h1UploadConn.UnreadedResponsesCount > 0 {
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
-						c.closed.Store(true)
+						// the pooled connection is broken, but the client
+						// and its other pooled connections are not: the
+						// connection is simply dropped by not being returned
+						// to the pool
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
 					io.Copy(io.Discard, resp.Body)
@@ -160,7 +188,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 				}
 			}
 
-			_, err := h1UploadConn.Write(requestBuff.Bytes())
+			_, err = h1UploadConn.Write(requestBuff.Bytes())
 			// if the write failed, we try another connection from
 			// the pool, until the write on a new connection fails.
 			// failed writes to a pooled connection are normal when
@@ -172,24 +200,79 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, sessio
 			}
 		}
 
-		c.uploadRawPool.Put(uploadConn)
+		c.uploadPool.returnConn(h1UploadConn)
 	}
 
 	return nil
 }
 
-// HTTP/1.1 and HTTP/2 will close itself, we only handle HTTP/3 here
-func (c *DefaultDialerClient) Close() error {
-	transport := c.client.Transport
-	if h3Transport, ok := transport.(*http3.Transport); ok {
-		h3Transport.Close()
+// CloseIdleConnections retires the client: no new requests should be issued
+// on it, but requests already in flight are allowed to finish. Physical
+// connections that are currently idle are closed right away, so that
+// connections of retired clients do not linger until IdleConnTimeout.
+func (c *DefaultDialerClient) CloseIdleConnections() {
+	if transport, ok := c.client.Transport.(interface{ CloseIdleConnections() }); ok {
+		transport.CloseIdleConnections()
 	}
+	c.uploadPool.closeIdle()
+}
+
+// Close implements common.Closable. For HTTP/3 the whole transport including
+// in-flight requests is terminated. HTTP/1.1 and HTTP/2 connections cannot be
+// force-closed through their transports, so for them this is equivalent to
+// CloseIdleConnections: idle connections are closed, in-flight requests are
+// allowed to finish.
+func (c *DefaultDialerClient) Close() error {
+	if h3Transport, ok := c.client.Transport.(*http3.Transport); ok {
+		h3Transport.Close()
+		return nil
+	}
+	c.CloseIdleConnections()
 	return nil
 }
 
 type WaitReadCloser struct {
 	wait   *done.Instance
 	reader atomic.Pointer[io.ReadCloser]
+
+	// onFinish is called exactly once, when the request that produced this
+	// reader has fully finished: either its response body was closed, or it
+	// failed before a response arrived. It may be registered after the
+	// request was issued, including after the reader was already closed
+	// without ever receiving a response: the callback then fires as soon as
+	// the pending request finishes.
+	mu       sync.Mutex
+	finished bool
+	onFinish func()
+}
+
+// finish marks the request as finished and fires the callback.
+func (w *WaitReadCloser) finish() {
+	w.mu.Lock()
+	if w.finished {
+		w.mu.Unlock()
+		return
+	}
+	w.finished = true
+	f := w.onFinish
+	w.mu.Unlock()
+	if f != nil {
+		f()
+	}
+}
+
+// OnFinish registers f to be called when the request has finished. If it
+// already has, f is called immediately.
+func (w *WaitReadCloser) OnFinish(f func()) {
+	w.mu.Lock()
+	already := w.finished
+	if !already {
+		w.onFinish = f
+	}
+	w.mu.Unlock()
+	if already {
+		f()
+	}
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
@@ -198,6 +281,7 @@ func (w *WaitReadCloser) Set(rc io.ReadCloser) {
 		if p := w.reader.Swap(nil); p != nil {
 			(*p).Close()
 		}
+		w.finish()
 	}
 	w.wait.Close()
 }
@@ -216,7 +300,9 @@ func (w *WaitReadCloser) Read(b []byte) (int, error) {
 func (w *WaitReadCloser) Close() error {
 	w.wait.Close()
 	if p := w.reader.Swap(nil); p != nil {
-		return (*p).Close()
+		err := (*p).Close()
+		w.finish()
+		return err
 	}
 	return nil
 }

@@ -23,12 +23,17 @@ func (c *splitConn) Read(b []byte) (int, error) {
 }
 
 func (c *splitConn) Close() error {
+	// close the underlying streams before notifying onClose: the XMUX
+	// reference is released there, and releasing it last guarantees that
+	// closing idle connections of a retired client actually finds this
+	// stream's connection idle
+	err := c.writer.Close()
+	err2 := c.reader.Close()
+
 	if c.onClose != nil {
 		c.onClose()
 	}
 
-	err := c.writer.Close()
-	err2 := c.reader.Close()
 	if err != nil {
 		return err
 	}

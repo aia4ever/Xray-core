@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"sync"
 	"sync/atomic"
 
 	"github.com/apernet/quic-go/http3"
@@ -32,8 +33,8 @@ type DialerClient interface {
 type DefaultDialerClient struct {
 	transportConfig *Config
 	client          *http.Client
-	closed          atomic.Bool
-	httpVersion     string
+	closed      atomic.Bool
+	httpVersion string
 	// pool of H1Conn for HTTP/1.1 uploads, created using dialUploadConn
 	uploadPool     *uploadConnPool
 	dialUploadConn func(ctxInner context.Context) (net.Conn, error)
@@ -78,6 +79,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 			gotConn.Close()
 			common.Close(body)
 			wrc.Close()
+			wrc.(*WaitReadCloser).finish()
 			return
 		}
 		if resp.StatusCode != 200 && !uploadOnly {
@@ -88,6 +90,7 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, sessio
 			resp.Body.Close() // if it is called immediately, the upload will be interrupted also
 			common.Close(body)
 			wrc.Close()
+			wrc.(*WaitReadCloser).finish()
 			return
 		}
 		wrc.(*WaitReadCloser).Set(resp.Body)
@@ -199,6 +202,36 @@ func (c *DefaultDialerClient) Close() error {
 type WaitReadCloser struct {
 	wait   *done.Instance
 	reader atomic.Pointer[io.ReadCloser]
+
+	mu       sync.Mutex
+	finished bool
+	onFinish func()
+}
+
+func (w *WaitReadCloser) finish() {
+	w.mu.Lock()
+	if w.finished {
+		w.mu.Unlock()
+		return
+	}
+	w.finished = true
+	f := w.onFinish
+	w.mu.Unlock()
+	if f != nil {
+		f()
+	}
+}
+
+func (w *WaitReadCloser) OnFinish(f func()) {
+	w.mu.Lock()
+	already := w.finished
+	if !already {
+		w.onFinish = f
+	}
+	w.mu.Unlock()
+	if already {
+		f()
+	}
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
@@ -207,6 +240,7 @@ func (w *WaitReadCloser) Set(rc io.ReadCloser) {
 		if p := w.reader.Swap(nil); p != nil {
 			(*p).Close()
 		}
+		w.finish()
 	}
 	w.wait.Close()
 }
@@ -225,7 +259,9 @@ func (w *WaitReadCloser) Read(b []byte) (int, error) {
 func (w *WaitReadCloser) Close() error {
 	w.wait.Close()
 	if p := w.reader.Swap(nil); p != nil {
-		return (*p).Close()
+		err := (*p).Close()
+		w.finish()
+		return err
 	}
 	return nil
 }

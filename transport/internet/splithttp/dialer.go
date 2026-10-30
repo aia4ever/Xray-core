@@ -44,6 +44,19 @@ var (
 	globalDialerAccess sync.Mutex
 )
 
+func holdStreamRequest(reader io.ReadCloser, xmuxClient *XmuxClient) {
+	if wrc, ok := reader.(*WaitReadCloser); ok && xmuxClient != nil {
+		xmuxClient.AddRequest()
+		wrc.OnFinish(xmuxClient.DoneRequest)
+	}
+}
+
+// getHTTPClient returns the DialerClient to use, together with the XMUX
+// client it belongs to. The XMUX client is returned with a running reference
+// already taken under globalDialerAccess: without it, a concurrent
+// getXmuxClient could retire and close the client in the window between its
+// selection here and the AddRunning of its caller. Callers must release the
+// reference with DoneRunning once they are done with the client.
 func getHTTPClient(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (DialerClient, *XmuxClient) {
 	realityConfig := reality.ConfigFromStreamSettings(streamSettings)
 
@@ -398,6 +411,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		errors.LogInfo(ctx, fmt.Sprintf("XHTTP is downloading from %s, mode %s, HTTP version %s, host %s", dest2, "stream-down", httpVersion2, requestURL2.Host))
 	}
 
+	// the running references for xmuxClient and xmuxClient2 were already
+	// taken by getHTTPClient, under globalDialerAccess; they are released
+	// by conn.onClose, also on the error paths below
 	var closed atomic.Int32
 
 	reader, writer := io.Pipe()
@@ -427,6 +443,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			conn.onClose()
 			return nil, err
 		}
+		holdStreamRequest(conn.reader, xmuxClient)
 		return stat.Connection(&conn), nil
 	} else { // stream-down
 		if xmuxClient2 != nil {
@@ -437,16 +454,19 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			conn.onClose()
 			return nil, err
 		}
+		holdStreamRequest(conn.reader, xmuxClient2)
 	}
 	if mode == "stream-up" {
 		if xmuxClient != nil {
 			xmuxClient.LeftRequests.Add(-1)
 		}
-		_, _, _, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, true)
+		var wrc io.ReadCloser
+		wrc, _, _, err = httpClient.OpenStream(ctx, requestURL.String(), sessionId, reader, true)
 		if err != nil { // browser dialer only
 			conn.onClose()
 			return nil, err
 		}
+		holdStreamRequest(wrc, xmuxClient)
 		return stat.Connection(&conn), nil
 	}
 
@@ -475,6 +495,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 		dynamicHTTPClient := httpClient
 		dynamicXmuxClient := xmuxClient
+		// the running reference of the initial client is owned by
+		// conn.onClose; running references of clients this loop rotates to
+		// are owned by the loop itself and must be released on the next
+		// rotation or when the loop exits
 		ownsRunningRef := false
 		defer func() {
 			if ownsRunningRef && dynamicXmuxClient != nil {
@@ -525,7 +549,11 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 					dynamicHTTPClient, dynamicXmuxClient = newHTTPClient, newXmuxClient
 				}
 
-				go func(hClient DialerClient) {
+				if dynamicXmuxClient != nil {
+					dynamicXmuxClient.AddRequest()
+				}
+
+				go func(hClient DialerClient, xClient *XmuxClient) {
 					err := hClient.PostPacket(
 						ctx,
 						requestURL.String(),
@@ -534,12 +562,15 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 						chunk,
 					)
 					wroteRequest.Close()
+					if xClient != nil {
+						xClient.DoneRequest()
+					}
 					if err != nil {
 						errors.LogInfoInner(ctx, err, "failed to send upload")
 						uploadPipeReader.Interrupt()
 						doSplit.Store(false)
 					}
-				}(dynamicHTTPClient)
+				}(dynamicHTTPClient, dynamicXmuxClient)
 
 				if _, ok := dynamicHTTPClient.(*DefaultDialerClient); ok {
 					<-wroteRequest.Wait()

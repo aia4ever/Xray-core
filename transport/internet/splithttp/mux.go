@@ -23,6 +23,7 @@ type XmuxClient struct {
 	LeftRequests atomic.Int32
 	UnreusableAt time.Time
 	NotUsed      atomic.Bool
+	Requests atomic.Int32
 }
 
 func (c *XmuxClient) AddRunning() {
@@ -34,9 +35,18 @@ func (c *XmuxClient) DoneRunning() {
 	c.maybeClose()
 }
 
+func (c *XmuxClient) AddRequest() {
+	c.Requests.Add(1)
+}
+
+func (c *XmuxClient) DoneRequest() {
+	c.Requests.Add(-1)
+	c.maybeClose()
+}
+
 // close the XmuxConn if it is not used and has no running requests
 func (c *XmuxClient) maybeClose() {
-	if c.NotUsed.Load() && c.Running.Load() <= 0 {
+	if c.NotUsed.Load() && c.Running.Load() <= 0 && c.Requests.Load() <= 0 {
 		if idleCloser, ok := c.XmuxConn.(interface{ CloseIdleConnections() }); ok {
 			// retire the connection: idle connections are closed,
 			// in-flight requests are allowed to finish

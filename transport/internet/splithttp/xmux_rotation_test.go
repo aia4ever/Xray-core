@@ -120,13 +120,13 @@ func Test_ListenXHAndDial_InFlightUploadOutlivesRotation(t *testing.T) {
 	var posts atomic.Int32
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodGet:
+		case http.MethodGet: // the download stream
 			select {
 			case <-release:
 			case <-r.Context().Done():
 			}
 			return
-		case http.MethodPost:
+		case http.MethodPost: // an upload packet
 			posts.Add(1)
 			select {
 			case <-release:
@@ -176,6 +176,13 @@ func Test_ListenXHAndDial_InFlightUploadOutlivesRotation(t *testing.T) {
 	waitForCondition(t, 5*time.Second, &active, 1, "retired client did not close its connection after its last POST finished")
 }
 
+// Streams dialed concurrently on a fresh HTTP/2 client must share a single
+// physical connection: golang.org/x/net before v0.60.0 let every request
+// that arrived while the first connection was still being established dial
+// its own connection (XTLS/Xray-core#6797), so a burst of concurrent streams
+// opened a burst of TCP connections to the same host. This pins the fixed
+// pool behavior: with maxConnections=1, any number of concurrent streams
+// must never dial a second connection.
 func Test_ListenXHAndDial_ConcurrentRequestsDialOneConnection(t *testing.T) {
 	if runtime.GOARCH == "arm64" {
 		return
@@ -188,6 +195,7 @@ func Test_ListenXHAndDial_ConcurrentRequestsDialOneConnection(t *testing.T) {
 		switch r.Method {
 		case http.MethodGet: // the download stream
 			if streams.Add(1) == streamsWanted {
+				// all streams are open now, let them finish
 				close(release)
 			} else {
 				select {
